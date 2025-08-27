@@ -1,0 +1,144 @@
+version: '3.8'
+
+services:
+  # Nginx для HTTP challenge
+  nginx:
+    image: nginx:alpine
+    container_name: relay-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - certbot-webroot:/var/www/certbot:ro
+    networks:
+      - relay-net
+
+  # Certbot для получения сертификатов
+  certbot:
+    image: certbot/certbot:latest
+    container_name: relay-certbot
+    restart: unless-stopped
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+    environment:
+      - DOMAIN=${RELAY_DOMAIN:-relay.r-i-m.ru}
+      - EMAIL=${LETSENCRYPT_EMAIL:-admin@r-i-m.ru}
+    entrypoint: |
+      sh -c '
+      trap exit TERM
+      # Получение первого сертификата
+      if [ ! -f "/etc/letsencrypt/live/$$DOMAIN/fullchain.pem" ]; then
+        echo "Получение сертификата для $$DOMAIN..."
+        certbot certonly \
+          --webroot \
+          --webroot-path=/var/www/certbot \
+          --email $$EMAIL \
+          --agree-tos \
+          --no-eff-email \
+          --domains $$DOMAIN \
+          --keep-until-expiring
+      fi
+      # Автообновление каждые 12 часов
+      while :; do
+        echo "Проверка обновления сертификатов..."
+        certbot renew --webroot --webroot-path=/var/www/certbot
+        sleep 43200
+      done
+      '
+    networks:
+      - relay-net
+
+  # SMTP Postfix Relay
+  postfix:
+    image: alpine:latest
+    container_name: relay-postfix
+    restart: unless-stopped
+    hostname: ${RELAY_DOMAIN:-relay.r-i-m.ru}
+    ports:
+      - "25:25"
+      - "587:587"
+    volumes:
+      - letsencrypt:/etc/letsencrypt:ro
+      - postfix-queue:/var/spool/postfix
+      - postfix-lib:/var/lib/postfix
+    environment:
+      - DOMAIN=${RELAY_DOMAIN:-relay.r-i-m.ru}
+      - TRUSTED_NETWORKS=${MAILCOW_IP:-192.168.1.100}/32
+    entrypoint: |
+      sh -c '
+      # Установка Postfix
+      apk add --no-cache postfix postfix-tls ca-certificates supervisor cyrus-sasl
+      
+      # Ожидание сертификатов
+      echo "Ожидание сертификатов для $$DOMAIN..."
+      while [ ! -f "/etc/letsencrypt/live/$$DOMAIN/fullchain.pem" ]; do
+        sleep 10
+      done
+      echo "✓ Сертификаты найдены!"
+      
+      # Настройка Postfix
+      postconf -e "myhostname=$$DOMAIN"
+      postconf -e "mydomain=$${DOMAIN#*.}"
+      postconf -e "myorigin=\$$mydomain"
+      postconf -e "mydestination="
+      postconf -e "relayhost="
+      postconf -e "mynetworks=127.0.0.0/8,$$TRUSTED_NETWORKS"
+      postconf -e "inet_interfaces=all"
+      postconf -e "inet_protocols=ipv4"
+      postconf -e "message_size_limit=52428800"
+      
+      # Relay настройки
+      postconf -e "smtpd_recipient_restrictions=permit_mynetworks,reject_unauth_destination"
+      
+      # TLS настройки
+      postconf -e "smtpd_use_tls=yes"
+      postconf -e "smtpd_tls_security_level=may"
+      postconf -e "smtpd_tls_cert_file=/etc/letsencrypt/live/$$DOMAIN/fullchain.pem"
+      postconf -e "smtpd_tls_key_file=/etc/letsencrypt/live/$$DOMAIN/privkey.pem"
+      postconf -e "smtpd_tls_session_cache_database=btree:/var/lib/postfix/smtpd_scache"
+      postconf -e "smtpd_tls_received_header=yes"
+      postconf -e "smtpd_tls_loglevel=1"
+      
+      # Исходящий TLS
+      postconf -e "smtp_use_tls=yes"
+      postconf -e "smtp_tls_security_level=may"
+      postconf -e "smtp_tls_session_cache_database=btree:/var/lib/postfix/smtp_scache"
+      
+      # Создание supervisor конфига
+      cat > /etc/supervisord.conf << EOF
+[supervisord]
+nodaemon=true
+user=root
+logfile=/var/log/supervisord.log
+pidfile=/var/run/supervisord.pid
+
+[program:postfix]
+command=/usr/sbin/postfix start-fg
+autorestart=true
+stdout_logfile=/var/log/postfix.log
+stderr_logfile=/var/log/postfix_error.log
+EOF
+      
+      # Инициализация Postfix
+      postfix set-permissions
+      newaliases
+      
+      echo "🚀 Запуск Postfix..."
+      exec /usr/bin/supervisord -c /etc/supervisord.conf
+      '
+    depends_on:
+      - certbot
+    networks:
+      - relay-net
+
+volumes:
+  letsencrypt:
+  certbot-webroot:
+  postfix-queue:
+  postfix-lib:
+
+networks:
+  relay-net:
+    driver: bridge
